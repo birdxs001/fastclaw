@@ -1,6 +1,5 @@
 name: build-and-push to ghcr and dockerhub
-
-# 仅支持手动触发，必须输入镜像版本标签
+  # 仅支持手动触发，必须输入镜像版本标签
 on:
   workflow_dispatch:
     inputs:
