@@ -1,5 +1,6 @@
-name: build-and-push to ghcr and dockerhub
+name: build-and-push ghcr-dockerhub
 
+# 仅支持手动触发，必须输入镜像版本标签
 on:
   workflow_dispatch:
     inputs:
@@ -15,13 +16,11 @@ permissions:
 env:
   GHCR_REGISTRY: ghcr.io
   DOCKERHUB_REGISTRY: docker.io
-  # GHCR 镜像名（使用仓库所有者/仓库名）
-  GHCR_IMAGE: ${{ env.GHCR_REGISTRY }}/${{ github.repository }}
-  # Docker Hub 镜像名（需提供用户名，仓库名与 GitHub 仓库名一致）
-  DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_REGISTRY }}/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+  # 以下变量已修复，不再引用其他 env
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  DOCKERHUB_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
 
 jobs:
-  # 获取版本元数据（这里只取输入 tag 和简短 commit）
   meta:
     runs-on: ubuntu-latest
     outputs:
@@ -37,7 +36,6 @@ jobs:
           echo "version=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
           echo "sha7=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-  # 分别构建并推送 amd64 / arm64 架构镜像（含架构后缀标签）
   build:
     needs: meta
     runs-on: ubuntu-latest
@@ -46,27 +44,21 @@ jobs:
         platform: [linux/amd64, linux/arm64]
     steps:
       - uses: actions/checkout@v4
-
-      # 设置 QEMU（用于非原生架构模拟，但 arm64 需要）
       - uses: docker/setup-qemu-action@v3
-
       - uses: docker/setup-buildx-action@v3
 
-      # 登录 GHCR
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 登录 Docker Hub
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.DOCKERHUB_REGISTRY }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # 生成平台后缀（如 linux-amd64）
       - name: Platform slug
         id: slug
         run: echo "slug=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> $GITHUB_OUTPUT
@@ -75,7 +67,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfilefix
+          file: Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
           tags: |
@@ -89,21 +81,18 @@ jobs:
           cache-from: type=gha,scope=${{ steps.slug.outputs.slug }}
           cache-to: type=gha,scope=${{ steps.slug.outputs.slug }},mode=max
 
-  # 合并多架构 manifest，生成不带架构后缀的版本标签和 latest 标签
   merge:
     needs: [meta, build]
     runs-on: ubuntu-latest
     steps:
       - uses: docker/setup-buildx-action@v3
 
-      # 登录 GHCR
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.GHCR_REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 登录 Docker Hub
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.DOCKERHUB_REGISTRY }}
@@ -112,14 +101,12 @@ jobs:
 
       - name: Create and push multi-arch manifests
         run: |
-          # GHCR 多架构清单
           docker buildx imagetools create \
             -t ${{ env.GHCR_IMAGE }}:${{ needs.meta.outputs.version }} \
             -t ${{ env.GHCR_IMAGE }}:latest \
             ${{ env.GHCR_IMAGE }}:${{ needs.meta.outputs.version }}-linux-amd64 \
             ${{ env.GHCR_IMAGE }}:${{ needs.meta.outputs.version }}-linux-arm64
 
-          # Docker Hub 多架构清单
           docker buildx imagetools create \
             -t ${{ env.DOCKERHUB_IMAGE }}:${{ needs.meta.outputs.version }} \
             -t ${{ env.DOCKERHUB_IMAGE }}:latest \
