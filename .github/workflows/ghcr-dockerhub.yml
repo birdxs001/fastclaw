@@ -15,57 +15,51 @@ permissions:
   packages: write
 
 env:
-  # GHCR 镜像基础名（用于后续 build 和 merge，但 meta 中会重新显式构造）
   GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/fastclaw
 
 jobs:
+  # --- 元数据：版本、短 SHA、日期，并生成所有标签（GHCR + Docker Hub） ---
   meta:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
       sha7: ${{ steps.meta.outputs.sha7 }}
       date: ${{ steps.meta.outputs.date }}
-      tags: ${{ steps.tags.outputs.tags }}
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 推导版本号
+      - name: 推导版本并生成标签
         id: meta
         run: |
+          # 1. 版本号
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
-            echo "version=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+            VERSION="${{ github.event.inputs.tag }}"
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            VERSION="${GITHUB_REF#refs/tags/}"
           else
-            echo "version=$(git describe --tags --always --dirty)" >> $GITHUB_OUTPUT
+            VERSION="$(git describe --tags --always --dirty)"
           fi
-          echo "sha7=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          SHA7="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-      - name: 生成所有镜像标签（GHCR + Docker Hub）
-        id: tags
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: |
-          # 显式构造 GHCR 镜像名（避免依赖全局 env 解析问题）
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "sha7=${SHA7}" >> $GITHUB_OUTPUT
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
+
+          # 2. GHCR 标签（始终存在）
           GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/fastclaw"
-          VERSION="${{ steps.meta.outputs.version }}"
-          SHA7="${{ steps.meta.outputs.sha7 }}"
-
-          # 初始 GHCR 标签（version 和 sha7）
           TAGS="${GHCR_IMAGE}:${VERSION},${GHCR_IMAGE}:${SHA7}"
-
-          # 分支额外标签
           case "${{ github.ref }}" in
             refs/heads/dev)  TAGS="${TAGS},${GHCR_IMAGE}:dev" ;;
             refs/heads/main) TAGS="${TAGS},${GHCR_IMAGE}:latest" ;;
           esac
 
-          # 若配置了 Docker Hub 用户名，则添加 Docker Hub 标签
-          if [ -n "$DOCKERHUB_USERNAME" ]; then
-            DOCKERHUB_IMAGE="docker.io/${DOCKERHUB_USERNAME}/fastclaw"
+          # 3. Docker Hub 标签（仅当配置了用户名）
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            DOCKERHUB_IMAGE="docker.io/${{ secrets.DOCKERHUB_USERNAME }}/fastclaw"
             TAGS="${TAGS},${DOCKERHUB_IMAGE}:${VERSION},${DOCKERHUB_IMAGE}:${SHA7}"
             case "${{ github.ref }}" in
               refs/heads/dev)  TAGS="${TAGS},${DOCKERHUB_IMAGE}:dev" ;;
@@ -74,9 +68,9 @@ jobs:
           fi
 
           echo "tags=${TAGS}" >> $GITHUB_OUTPUT
-          # 调试输出（可查看标签列表）
-          echo "Generated tags: ${TAGS}"
+          echo "Generated tags: ${TAGS}"   # 调试输出，可在日志中查看
 
+  # --- 并行构建每个架构，仅推送到 GHCR（中间存储） ---
   build:
     needs: meta
     runs-on: ubuntu-latest
@@ -93,7 +87,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 平台标识
+      - name: 平台标识（用于缓存和 digest 文件）
         id: slug
         run: echo "slug=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> $GITHUB_OUTPUT
 
@@ -126,22 +120,23 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # --- 合并所有架构的 digest，创建多架构 manifest 并推送到 GHCR + Docker Hub ---
   merge:
     needs: [meta, build]
     runs-on: ubuntu-latest
-    env:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - uses: docker/setup-buildx-action@v3
 
+      # 登录 GHCR（必需）
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 登录 Docker Hub（如配置）
-        if: env.DOCKERHUB_USERNAME != ''
+      # 登录 Docker Hub（仅当生成的标签包含 docker.io）
+      - name: 登录 Docker Hub
+        if: contains(needs.meta.outputs.tags, 'docker.io')
         uses: docker/login-action@v3
         with:
           registry: docker.io
@@ -158,7 +153,6 @@ jobs:
         working-directory: ${{ runner.temp }}/digests
         run: |
           TAGS="${{ needs.meta.outputs.tags }}"
-          # 检查标签是否为空（不应为空）
           if [ -z "$TAGS" ]; then
             echo "错误：未生成任何标签，请检查 meta 步骤"
             exit 1
@@ -171,6 +165,6 @@ jobs:
             TAG_ARGS="$TAG_ARGS -t $t"
           done
 
-          # 引用 GHCR 上的单架构 digest
+          # 引用 GHCR 上的单架构镜像 digest
           docker buildx imagetools create $TAG_ARGS \
             $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
