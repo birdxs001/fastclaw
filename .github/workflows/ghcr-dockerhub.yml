@@ -1,0 +1,169 @@
+name: build-and-push to ghcr and dockerhub
+
+# 构建多架构镜像并推送到 GHCR 和 Docker Hub（可选）
+# 触发: push 到 dev/main 或打 v*.*.* tag, 或手动 workflow_dispatch
+on:
+  push:
+    branches: [dev, main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 覆盖镜像 tag(可选)
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/fastclaw
+  # Docker Hub 用户名（若未配置则后续跳过 Docker Hub 推送）
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  # --- 元数据：版本号、短 SHA、日期，并生成所有标签 ---
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha7: ${{ steps.meta.outputs.sha7 }}
+      date: ${{ steps.meta.outputs.date }}
+      tags: ${{ steps.tags.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 推导版本号
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "version=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "version=$(git describe --tags --always --dirty)" >> $GITHUB_OUTPUT
+          fi
+          echo "sha7=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: 生成所有镜像标签（GHCR + Docker Hub）
+        id: tags
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}  # 供 shell 使用
+        run: |
+          # GHCR 标签（始终生成）
+          TAGS="${{ env.GHCR_IMAGE }}:${{ steps.meta.outputs.version }},${{ env.GHCR_IMAGE }}:${{ steps.meta.outputs.sha7 }}"
+          case "${{ github.ref }}" in
+            refs/heads/dev)  TAGS="$TAGS,${{ env.GHCR_IMAGE }}:dev" ;;
+            refs/heads/main) TAGS="$TAGS,${{ env.GHCR_IMAGE }}:latest" ;;
+          esac
+
+          # Docker Hub 标签（仅当配置了用户名）
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            DOCKERHUB_IMAGE="docker.io/$DOCKERHUB_USERNAME/fastclaw"
+            TAGS="$TAGS,$DOCKERHUB_IMAGE:${{ steps.meta.outputs.version }},$DOCKERHUB_IMAGE:${{ steps.meta.outputs.sha7 }}"
+            case "${{ github.ref }}" in
+              refs/heads/dev)  TAGS="$TAGS,$DOCKERHUB_IMAGE:dev" ;;
+              refs/heads/main) TAGS="$TAGS,$DOCKERHUB_IMAGE:latest" ;;
+            esac
+          fi
+
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+
+  # --- 并行构建每个架构，仅推送到 GHCR（作为中间存储） ---
+  build:
+    needs: meta
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 平台标识（用于缓存和 digest 文件）
+        id: slug
+        run: echo "slug=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> $GITHUB_OUTPUT
+
+      - name: 构建并推送单架构镜像（仅 GHCR）
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          outputs: type=image,"name=${{ env.GHCR_IMAGE }}",push-by-digest=true,name-canonical=true
+          build-args: |
+            VERSION=${{ needs.meta.outputs.version }}
+            COMMIT=${{ needs.meta.outputs.sha7 }}
+            DATE=${{ needs.meta.outputs.date }}
+          cache-from: type=gha,scope=${{ steps.slug.outputs.slug }}
+          cache-to: type=gha,scope=${{ steps.slug.outputs.slug }},mode=max
+
+      - name: 导出 digest 供后续合并
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ steps.slug.outputs.slug }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # --- 合并所有架构的 digest，创建多架构 manifest 并推送到 GHCR + Docker Hub ---
+  merge:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}   # 用于条件判断
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      # 登录 GHCR（必需）
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 登录 Docker Hub（仅当配置了用户名）
+      - name: 登录 Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: 创建并推送 manifest list（同时支持 GHCR 和 Docker Hub）
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # 从 meta 获取所有标签（已包含两个 registry）
+          TAGS="${{ needs.meta.outputs.tags }}"
+          TAG_ARGS=""
+          IFS=',' read -ra TAG_ARRAY <<< "$TAGS"
+          for t in "${TAG_ARRAY[@]}"; do
+            TAG_ARGS="$TAG_ARGS -t $t"
+          done
+
+          # 引用 GHCR 上的单架构镜像 digest
+          docker buildx imagetools create $TAG_ARGS \
+            $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
